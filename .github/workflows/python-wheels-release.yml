@@ -1,0 +1,111 @@
+name: Python wheels test and release
+
+# Runs after "Python wheels" finishes. Installing each wheel from its artifact in a
+# clean environment is a different question from building it, so it gets its own
+# workflow: the build job's own cibuildwheel test-command runs inside the build
+# container, while this one installs the finished artifact the way a user would.
+#
+# A workflow_run trigger only fires when this file is on the default branch, and it
+# always runs the copy from the default branch rather than the branch under test.
+on:
+  workflow_run:
+    workflows: ["Python wheels"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test ${{ matrix.platform }}
+    # release is the only branch we ship from. py-interface still builds, but is
+    # not tested here and never publishes.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'release'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+          - platform: macos-arm64
+            runner: macos-14
+          - platform: windows-x86_64
+            runner: windows-2022
+          - platform: windows-arm64-experimental
+            runner: windows-11-arm
+    steps:
+      # The smoke script only; no submodules, and the commit that was built.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          sparse-checkout: packaging
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Download this platform's wheels
+        uses: actions/download-artifact@v4
+        with:
+          name: kitten-tts-cpp-${{ matrix.platform }}
+          path: wheelhouse
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      # Dependencies first, from the indexes: the CPU torch index keeps this to the
+      # build's own torch rather than pulling the CUDA wheel on Linux.
+      - name: Install dependencies
+        run: >-
+          python -m pip install --upgrade pip &&
+          python -m pip install numpy soundfile certifi torch
+          --extra-index-url https://download.pytorch.org/whl/cpu
+      # Then the artifact alone. --no-index is what guarantees this tests the wheel
+      # that was just built and not the copy already on PyPI, and pip picks the file
+      # matching this interpreter and platform.
+      - name: Install the built wheel
+        run: python -m pip install --no-deps --no-index --find-links wheelhouse kitten-tts-cpp
+      - name: Smoke-test the installed wheel
+        env:
+          KITTEN_WHEEL_NETWORK_TEST: '1'
+        run: python packaging/smoke_wheel.py
+
+  publish:
+    name: Publish to PyPI
+    needs: test
+    # Release branch only. `needs` already requires every test job to have
+    # succeeded, and each of those required a successful build.
+    if: github.event.workflow_run.head_branch == 'release'
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/project/kitten-tts-cpp/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download every platform's wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: kitten-tts-cpp-*
+          path: dist
+          merge-multiple: true
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: List and validate what will be uploaded
+        run: >-
+          ls -l dist &&
+          python -m pip install twine &&
+          python -m twine check dist/*.whl
+      # Trusted publishing: no long-lived token in the repository. PyPI needs a
+      # publisher for this repo, workflow python-wheels-release.yml, environment
+      # pypi. To use an API token instead, drop id-token above and pass
+      # password: ${{ secrets.PYPI_API_TOKEN }} here.
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          # A re-push of an already-published version should be a no-op, not a
+          # red build.
+          skip-existing: true
