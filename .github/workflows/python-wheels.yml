@@ -3,6 +3,7 @@ name: Python wheels
 on:
   push:
     branches:
+      - release
       - py-interface
   workflow_dispatch:
     inputs:
